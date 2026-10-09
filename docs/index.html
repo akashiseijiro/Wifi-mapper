@@ -1,0 +1,218 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1720">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<title>WiFi Room Mapper</title>
+<style>
+  :root {
+    --bg:#f4f6f8; --card:#fff; --text:#16202a; --muted:#66727f; --line:#dde3e8; --accent:#1f6feb;
+    --exc:#2e9e4f; --good:#7fae22; --weak:#d9921a; --poor:#d03a2f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0f1720; --card:#18222d; --text:#e8eef3; --muted:#8b99a6; --line:#2a3846; --accent:#5b9dff; }
+  }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.4 system-ui,sans-serif;
+         padding:max(16px,env(safe-area-inset-top)) 16px 40px; max-width:560px; margin-inline:auto; }
+  h1 { font-size:20px; margin:4px 0 2px; }
+  .sub { color:var(--muted); font-size:13px; margin-bottom:16px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }
+  label { font-size:13px; color:var(--muted); display:block; margin-bottom:6px; }
+  input[type=text] { width:100%; font:inherit; padding:12px; border-radius:10px; border:1px solid var(--line);
+         background:var(--bg); color:var(--text); }
+  button { font:inherit; border:0; border-radius:10px; padding:13px 16px; background:var(--accent); color:#fff;
+         font-weight:600; width:100%; margin-top:10px; }
+  button:disabled { opacity:.55; }
+  button.ghost { background:transparent; color:var(--accent); border:1px solid var(--line); width:auto; margin:0; padding:9px 12px; font-weight:500; font-size:14px; }
+  .bar { height:10px; border-radius:6px; background:var(--line); overflow:hidden; margin:8px 0; }
+  .bar > i { display:block; height:100%; border-radius:6px; transition:width .3s; }
+  .row { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+  .room { font-weight:700; font-size:17px; }
+  .score { font-weight:700; }
+  .stats { display:flex; flex-wrap:wrap; gap:4px 14px; color:var(--muted); font-size:13px; }
+  .stats b { color:var(--text); font-weight:600; }
+  .toolbar { display:flex; gap:8px; flex-wrap:wrap; }
+  .best { font-size:11px; background:var(--exc); color:#fff; border-radius:6px; padding:2px 6px; margin-left:6px; vertical-align:middle; }
+  .status { font-size:14px; color:var(--muted); min-height:20px; margin-top:8px; }
+  .note { font-size:12px; color:var(--muted); line-height:1.5; }
+  .x { background:none; border:0; color:var(--muted); width:auto; padding:2px 6px; margin:0; font-size:18px; }
+</style>
+</head>
+<body>
+<h1>WiFi Room Mapper</h1>
+<div class="sub">Walk room to room, measure, then place your extender where the score holds up.</div>
+
+<div class="card">
+  <label for="room">Room name</label>
+  <input id="room" type="text" placeholder="e.g. Bedroom" autocomplete="off" enterkeyhint="go">
+  <button id="go">Measure this room</button>
+  <div class="status" id="status"></div>
+  <div class="bar" id="liveBar" hidden><i id="liveFill" style="width:0"></i></div>
+  <div class="stats" id="netinfo"></div>
+</div>
+
+<div class="toolbar" style="margin-bottom:12px">
+  <button class="ghost" id="export">Export CSV</button>
+  <button class="ghost" id="clear">Clear all</button>
+</div>
+
+<div id="list"></div>
+
+<div class="card note">
+  Browsers can't read WiFi signal strength or the network name, so this measures what you actually
+  experience: latency, jitter, packet loss and download/upload speed through your WiFi. Compare rooms
+  <b>on the same network</b> (stay on the router's WiFi, or on the extender's, while testing).
+  Speed scores are relative to the best result recorded. Results stay on this phone.
+</div>
+
+<script>
+"use strict";
+const BASE = "https://speed.cloudflare.com";
+const KEY = "wifiRooms.v1";
+const PINGS = 8, DL_BYTES = 8_000_000, UL_BYTES = 1_000_000;
+
+const $ = id => document.getElementById(id);
+let rooms = load();
+let busy = false;
+
+function load() { try { return JSON.parse(localStorage.getItem(KEY)) || []; } catch { return []; } }
+function save() { try { localStorage.setItem(KEY, JSON.stringify(rooms)); } catch {} }
+
+// ---------- measurements ----------
+async function timedFetch(url, opts = {}, ms = 5000) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), ms);
+  try { return await fetch(url, { cache: "no-store", signal: ctl.signal, ...opts }); }
+  finally { clearTimeout(t); }
+}
+
+async function measureLatency(onTick) {
+  const times = []; let lost = 0;
+  await timedFetch(`${BASE}/__down?bytes=0`).catch(() => {});        // warm up TLS/DNS, ignored
+  for (let i = 0; i < PINGS; i++) {
+    const t0 = performance.now();
+    try { const r = await timedFetch(`${BASE}/__down?bytes=0&r=${Math.random()}`, {}, 3000); await r.arrayBuffer(); times.push(performance.now() - t0); }
+    catch { lost++; }
+    onTick(i + 1, PINGS);
+  }
+  if (!times.length) return { avg: null, max: null, loss: 100 };
+  return { avg: times.reduce((a, b) => a + b) / times.length, max: Math.max(...times), loss: 100 * lost / PINGS };
+}
+
+async function measureDownload() {
+  const t0 = performance.now(); let got = 0;
+  try {
+    const r = await timedFetch(`${BASE}/__down?bytes=${DL_BYTES}&r=${Math.random()}`, {}, 10000);
+    const rd = r.body.getReader();
+    for (;;) { const { done, value } = await rd.read(); if (done) break; got += value.length; }
+  } catch { /* use whatever arrived */ }
+  const s = (performance.now() - t0) / 1000;
+  return got > 100000 ? got * 8 / s / 1e6 : null;
+}
+
+async function measureUpload() {
+  const body = new Uint8Array(UL_BYTES);
+  const t0 = performance.now();
+  try {
+    await timedFetch(`${BASE}/__up`, { method: "POST", body }, 10000);
+    return UL_BYTES * 8 / ((performance.now() - t0) / 1000) / 1e6;
+  } catch { return null; }
+}
+
+function scoreOf(r, refDl) {
+  if (r.ping == null) return 0;
+  const speed = r.dl == null ? 0 : Math.min(r.dl / Math.max(refDl, 25), 1);
+  const lat = Math.max(0, 1 - (r.ping - 20) / 150);
+  const jit = Math.max(0, 1 - (r.pingMax - r.ping) / 200);
+  const s = 100 * (0.5 * speed + 0.3 * lat + 0.2 * jit) * (1 - Math.min(r.loss, 50) / 50);
+  return Math.min(100, Math.round(s));
+}
+function rate(s) {
+  return s >= 75 ? ["Excellent", "var(--exc)"] : s >= 55 ? ["Good", "var(--good)"]
+       : s >= 35 ? ["Weak", "var(--weak)"] : ["Poor", "var(--poor)"];
+}
+
+// ---------- UI ----------
+function setStatus(t) { $("status").textContent = t; }
+function setLive(p) { $("liveBar").hidden = p == null; if (p != null) { $("liveFill").style.width = p + "%"; $("liveFill").style.background = "var(--accent)"; } }
+
+async function run() {
+  if (busy) return;
+  const name = $("room").value.trim();
+  if (!name) { setStatus("Enter a room name first."); $("room").focus(); return; }
+  if (!navigator.onLine) { setStatus("Phone is offline. Connect to WiFi first."); return; }
+  busy = true; $("go").disabled = true;
+  try {
+    setLive(0); setStatus("Measuring latency…");
+    const lat = await measureLatency((i, n) => setLive(35 * i / n));
+    if (lat.avg == null) { setStatus("No response from the internet. Check your WiFi."); return; }
+    setStatus("Measuring download…"); setLive(40);
+    const dl = await measureDownload(); setLive(75);
+    setStatus("Measuring upload…");
+    const ul = await measureUpload(); setLive(100);
+
+    const rec = { room: name, ping: Math.round(lat.avg), pingMax: Math.round(lat.max), loss: lat.loss,
+                  dl: dl && +dl.toFixed(1), ul: ul && +ul.toFixed(1), time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) };
+    rooms.push(rec);
+    const ref = refSpeed();
+    rec.score = scoreOf(rec, ref);
+    save(); render();
+    $("room").value = "";
+    setStatus(`Saved ${name}: ${rec.score}/100`);
+  } catch (e) {
+    setStatus("Measurement failed: " + e.message);
+  } finally { busy = false; $("go").disabled = false; setTimeout(() => setLive(null), 800); }
+}
+
+function refSpeed() { return Math.max(25, ...rooms.map(r => r.dl || 0)); }
+
+function render() {
+  const ref = refSpeed();
+  rooms.forEach(r => r.score = scoreOf(r, ref));       // rescore as the reference changes
+  const best = rooms.length ? Math.max(...rooms.map(r => r.score)) : -1;
+  const list = $("list"); list.innerHTML = "";
+  rooms.forEach((r, i) => {
+    const [label, color] = rate(r.score);
+    const card = document.createElement("div"); card.className = "card";
+    const fmt = v => v == null ? "—" : v;
+    card.innerHTML = `
+      <div class="row"><span class="room"></span><span><span class="score" style="color:${color}">${r.score} · ${label}</span><button class="x" aria-label="Delete">✕</button></span></div>
+      <div class="bar"><i style="width:${r.score}%;background:${color}"></i></div>
+      <div class="stats"><span>↓ <b>${fmt(r.dl)}</b> Mbps</span><span>↑ <b>${fmt(r.ul)}</b> Mbps</span>
+        <span>ping <b>${r.ping}</b> ms (max ${r.pingMax})</span><span>loss <b>${Math.round(r.loss)}%</b></span><span>${r.time}</span></div>`;
+    const nameEl = card.querySelector(".room"); nameEl.textContent = r.room;
+    if (r.score === best && rooms.length > 1) nameEl.insertAdjacentHTML("beforeend", '<span class="best">BEST</span>');
+    card.querySelector(".x").onclick = () => { rooms.splice(i, 1); save(); render(); };
+    list.appendChild(card);
+  });
+}
+
+function showNet() {
+  const c = navigator.connection;
+  $("netinfo").innerHTML = c ? `<span>Browser reports: <b>${c.effectiveType || "?"}</b></span>` +
+    (c.downlink ? `<span>~<b>${c.downlink}</b> Mbps</span>` : "") + (c.type ? `<span>${c.type}</span>` : "") : "";
+}
+
+function exportCsv() {
+  if (!rooms.length) return;
+  const cols = ["room", "score", "dl", "ul", "ping", "pingMax", "loss", "time"];
+  const csv = [cols.join(","), ...rooms.map(r => cols.map(c => JSON.stringify(r[c] ?? "")).join(","))].join("\n");
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+  a.download = "wifi_rooms.csv"; a.click();
+}
+
+$("go").onclick = run;
+$("room").addEventListener("keydown", e => { if (e.key === "Enter") run(); });
+$("export").onclick = exportCsv;
+$("clear").onclick = () => { if (rooms.length && confirm("Delete all recorded rooms?")) { rooms = []; save(); render(); } };
+navigator.connection && navigator.connection.addEventListener("change", showNet);
+showNet(); render();
+if ("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").catch(() => {});
+</script>
+</body>
+</html>

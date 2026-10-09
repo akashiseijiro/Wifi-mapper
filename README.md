@@ -11,13 +11,23 @@ Carry your laptop to a room, type the room name, press **Record**. The app measu
 
 Results are saved to `wifi_rooms.json` (git-ignored) and can be exported to CSV.
 
-## Run
+## Windows app
 
 Requires Windows and Python 3 (no extra packages).
 
 ```
 python wifi_mapper.py
 ```
+
+## Android / phone web app
+
+A mobile-friendly PWA lives in [`docs/`](docs) and is served by GitHub Pages:
+https://akashiseijiro.github.io/Wifi-mapper/
+
+Open it in Chrome on your phone and choose **Add to Home screen**. Browsers cannot read WiFi signal
+strength or the network name, so it measures what you experience instead: latency, jitter, packet loss
+and download/upload speed (against Cloudflare's speed server). Turn mobile data off and stay on one
+WiFi network while comparing rooms. Results are stored on the phone only.
 
 ## Tips
 
